@@ -35,13 +35,18 @@ def _link(event_slug: str) -> str:
     return f'\n<a href="{url}">View market</a>'
 
 
-def format_cluster(c: Cluster, traders: dict, now_ts: int) -> str:
-    lines = [f"<b>[Polymarket] {len(c.positions)} top traders on the same pick</b>",
-             f"{_esc(c.title)}",
-             f"Pick: <b>{_esc(c.outcome)}</b>  |  combined {_usd(c.total_usd)} "
-             f"at avg price {c.avg_price:.2f}", ""]
+def format_cluster(c: Cluster, traders: dict, now_ts: int, update: bool = False) -> str:
+    n = len(c.positions)
+    head = (f"\U0001F3B2 <b>POLYMARKET \u00b7 UPDATE: now {n} top traders on the same pick</b>" if update
+            else f"\U0001F3B2 <b>POLYMARKET \u00b7 {n} top traders on the same pick</b>")
+    spread = max(1, round((c.last_ts - c.first_ts) / 60))
+    price = (f"{c.price_low:.2f}" if round(c.price_low, 2) == round(c.price_high, 2)
+             else f"{c.price_low:.2f}-{c.price_high:.2f}")
+    lines = [head, f"{_esc(c.title)}",
+             f"Pick: <b>{_esc(c.outcome)}</b>  |  {_usd(c.total_usd)} combined", 
+             f"Bought within {spread} min of each other  |  price {price}", ""]
     for p in c.positions:
-        lines.append(f"• {_who(p, traders)}: {_usd(p.usd)} @ {p.avg_price:.2f} "
+        lines.append(f"\u2022 {_who(p, traders)}: {_usd(p.usd)} @ {p.avg_price:.2f} "
                      f"({p.fills} fill{'s' if p.fills != 1 else ''}, last {_ago(p.last_ts, now_ts)})")
     if c.opposing_wallets:
         lines += ["", f"Other side: {c.opposing_wallets} top trader"
@@ -50,10 +55,29 @@ def format_cluster(c: Cluster, traders: dict, now_ts: int) -> str:
 
 
 def format_large(p: Position, traders: dict, now_ts: int) -> str:
-    return (f"<b>[Polymarket] Large bet by a top trader</b>\n"
+    return (f"🎲 <b>POLYMARKET · Large bet by a top trader</b>\n"
             f"{_who(p, traders)}: {_usd(p.usd)} @ {p.avg_price:.2f} "
             f"({p.fills} fill{'s' if p.fills != 1 else ''}, last {_ago(p.last_ts, now_ts)})\n"
             f"{_esc(p.title)}\nPick: <b>{_esc(p.outcome)}</b>") + _link(p.event_slug)
+
+
+SEPARATOR = "\n\n- - - - - - - - - -\n\n"
+
+
+def pack_messages(texts: list[str], limit: int = 3500) -> list[list[int]]:
+    """Group whole alerts into as few Telegram messages as fit (an alert is never split),
+    so a burst of alerts is one notification instead of many."""
+    groups, cur, size = [], [], 0
+    for i, t in enumerate(texts):
+        add = len(t) + len(SEPARATOR)
+        if cur and size + add > limit:
+            groups.append(cur)
+            cur, size = [], 0
+        cur.append(i)
+        size += add
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 def split_message(text: str, limit: int = TELEGRAM_LIMIT - 100) -> list[str]:

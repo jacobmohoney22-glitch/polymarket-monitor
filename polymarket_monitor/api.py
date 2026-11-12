@@ -96,6 +96,7 @@ class PolymarketClient:
     def __init__(self, user_agent: str, min_interval: float = 0.2):
         self.min_interval = min_interval
         self._last = 0.0
+        self.last_truncated = False
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent, "Accept": "application/json"})
         retries = Retry(total=3, backoff_factor=1.5,
@@ -124,6 +125,7 @@ class PolymarketClient:
         params = {"user": wallet, "side": "BUY", "start": start,
                   "limit": 500, "taker_only": "false"}
         out, cursor = [], None
+        self.last_truncated = False
         for _ in range(max_pages):
             page = dict(params)
             if cursor:
@@ -132,4 +134,6 @@ class PolymarketClient:
             out.extend(fills)
             if not cursor:
                 break
+        else:
+            self.last_truncated = cursor is not None   # more pages existed than we read
         return out

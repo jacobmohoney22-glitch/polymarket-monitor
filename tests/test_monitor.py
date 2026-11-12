@@ -5,9 +5,10 @@ import pytest
 from polymarket_monitor.api import (PolymarketClient, parse_leaderboard, parse_trade,
                                     parse_trades_page)
 from polymarket_monitor.config import Config
-from polymarket_monitor.notify import format_cluster, split_message
+from polymarket_monitor.notify import format_cluster, pack_messages, split_message
 from polymarket_monitor.runner import run_once
-from polymarket_monitor.signals import build_positions, find_clusters, find_large
+from polymarket_monitor.signals import build_positions as _build
+from polymarket_monitor.signals import find_clusters as _clusters, find_large as _large
 from polymarket_monitor.state import State
 from tests.helpers import FakeClient, FakeNotifier, page, trade_row, traders
 
@@ -21,6 +22,21 @@ def cfg(tmp_path, **kw):
 
 def fills(*rows):
     return [parse_trade(r) for r in rows]
+
+
+def find_clusters(pos, c, now_ts=T):
+    return _clusters(pos, c, now_ts)
+
+
+def find_large(pos, c, now_ts=T):
+    return _large(pos, c, now_ts)
+
+
+def build_positions(fl, c, now_ts):
+    """Go through State exactly like the runner does (fills -> buckets -> positions)."""
+    st = State()
+    st.add_fills(fl)
+    return _build(st.stakes, st.markets, {}, c, now_ts)
 
 
 # ---------- parsing ----------
@@ -212,11 +228,13 @@ def test_corrupt_state_not_silently_reset(tmp_path):
         State.load(str(p))
 
 
-def test_prune_drops_old_fills(tmp_path):
+def test_prune_drops_old_stakes_and_fill_ids():
     s = State()
-    s.add_fills(fills(trade_row("0xa", ts=T - 40 * 3600), trade_row("0xb", ts=T - 60)))
+    s.add_fills(fills(trade_row("0xa", cond="0xold", ts=T - 40 * 3600),
+                      trade_row("0xb", cond="0xnew", ts=T - 60)))
     s.prune(T, 24)
-    assert len(s.fills) == 1
+    assert [k.split("|")[1] for k in s.stakes] == ["0xnew"]
+    assert list(s.markets) == ["0xnew"] and len(s.seen) == 1
 
 
 def test_split_message_limit():
@@ -237,3 +255,183 @@ def test_dust_wallet_does_not_fill_out_a_cluster(tmp_path):
     assert find_clusters(build_positions(fills(*rows), cfg(tmp_path), T), cfg(tmp_path)) == []
     rows[2] = trade_row("0xc", ts=T - 600, price=0.5, size=1000)      # $500: a real stake
     assert len(find_clusters(build_positions(fills(*rows), cfg(tmp_path), T), cfg(tmp_path))) == 1
+
+
+def test_same_fill_read_twice_counts_once(tmp_path):
+    row = trade_row("0xa", ts=T - 60, price=0.5, size=40000, tx="0xsame")     # $20,000
+    st = State()
+    assert st.add_fills(fills(row)) == 1
+    assert st.add_fills(fills(row)) == 0                    # overlap re-read is ignored
+    (p,) = _build(st.stakes, st.markets, {}, cfg(tmp_path), T)
+    assert p.usd == 20000 and p.fills == 1
+
+
+def test_wallet_on_both_sides_is_ignored(tmp_path):
+    # 0xa backs Lakers AND Celtics (market-making / hedging); 0xb and 0xc back Lakers
+    rows = [trade_row("0xa", ts=T - 600, price=0.5, size=40000),
+            trade_row("0xa", ts=T - 600, oi=1, outcome="Celtics", price=0.5, size=40000),
+            trade_row("0xb", ts=T - 600, price=0.5, size=2000),
+            trade_row("0xc", ts=T - 600, price=0.5, size=2000)]
+    pos = build_positions(fills(*rows), cfg(tmp_path), T)
+    assert find_large(pos, cfg(tmp_path)) == []              # 0xa's $20k bets don't count
+    assert find_clusters(pos, cfg(tmp_path)) == []           # and 0xa doesn't make it 3 wallets
+    one_sided = [r for r in rows if r["outcome_index"] == 0]
+    assert len(find_clusters(build_positions(fills(*one_sided), cfg(tmp_path), T), cfg(tmp_path))) == 1
+
+
+def test_state_stays_small_for_a_bot_heavy_day(tmp_path):
+    import random
+    random.seed(1)
+    st = State()
+    rows = []
+    for w in range(50):                                      # ~15,000 fills in 24h, like the real dry run
+        for i in range(300):
+            pick = random.randrange(25)
+            rows.append(trade_row(f"0x{w:040x}", cond=f"0x{pick:064x}", oi=pick % 2,
+                                  ts=T - random.randrange(24 * 3600), size=random.uniform(10, 500),
+                                  price=random.uniform(0.2, 0.8), tx=f"0x{w}-{i}"))
+    st.add_fills(fills(*rows))
+    st.prune(T, 24)
+    path = tmp_path / "state.json"
+    st.save(str(path))
+    assert path.stat().st_size < 2_000_000                   # the per-fill version was ~10 MB
+
+
+def test_truncation_is_reported(tmp_path):
+    class Trunc(FakeClient):
+        last_truncated = True
+    s = run_once(cfg(tmp_path), Trunc(traders("0xa")), FakeNotifier(), now=NOW)
+    assert s["truncated_wallets"] == 1
+
+
+def test_truncation_flag_set_by_real_client(monkeypatch):
+    c = PolymarketClient("test", min_interval=0)
+    monkeypatch.setattr(c, "_get_json", lambda path, params: page([trade_row("0xa")], "MORE"))
+    c.trades("0xa", start=1, max_pages=2)
+    assert c.last_truncated is True
+    monkeypatch.setattr(c, "_get_json", lambda path, params: page([trade_row("0xa")]))
+    c.trades("0xa", start=1, max_pages=2)
+    assert c.last_truncated is False
+
+
+def test_every_polymarket_message_is_clearly_labelled(tmp_path):
+    c, n = cfg(tmp_path), FakeNotifier()
+    client = FakeClient(traders(*WALLETS))
+    run_once(c, client, n, now=NOW)
+    now2 = NOW + timedelta(minutes=10)
+    t2 = int(now2.timestamp())
+    for w in ("0xa", "0xb", "0xc"):
+        client.rows[w] = [trade_row(w, ts=t2 - 60, price=0.5, size=2000)]
+    client.rows["0xd"] = [trade_row("0xd", cond="0xbig", ts=t2 - 60, price=0.4, size=50000)]
+    run_once(c, client, n, now=now2)
+    assert len(n.sent) == 2                      # start message + ONE bundle (cluster + large bet)
+    assert all(m.startswith("\U0001F3B2") for m in n.sent)
+    assert n.sent[1].count("POLYMARKET") == 2 and "Large bet" in n.sent[1] and "3 top traders" in n.sent[1]
+
+
+# ---------- time-window clusters, freshness, bundling ----------
+def at(wallet, minutes_ago, **kw):
+    kw.setdefault("price", 0.5)
+    kw.setdefault("size", 2000)
+    return trade_row(wallet, ts=T - minutes_ago * 60, **kw)
+
+
+def clusters_of(rows, tmp_path, **cfg_kw):
+    c = cfg(tmp_path, **cfg_kw)
+    return find_clusters(build_positions(fills(*rows), c, T), c)
+
+
+def test_buys_far_apart_in_time_are_not_a_cluster(tmp_path):
+    # three traders, but 3 hours apart: a follower could not get a similar price
+    assert clusters_of([at("0xa", 200), at("0xb", 100), at("0xc", 10)], tmp_path) == []
+
+
+def test_only_the_traders_inside_the_window_are_reported(tmp_path):
+    rows = [at("0xold", 300), at("0xa", 25), at("0xb", 15), at("0xc", 5)]
+    (cl,) = clusters_of(rows, tmp_path)
+    assert {p.wallet for p in cl.positions} == {"0xa", "0xb", "0xc"}      # 0xold is hours earlier
+    assert (cl.last_ts - cl.first_ts) // 60 == 20
+
+
+def test_window_length_is_configurable(tmp_path):
+    rows = [at("0xa", 40), at("0xb", 25), at("0xc", 5)]                   # spread = 35 min
+    assert len(clusters_of(rows, tmp_path)) == 1                          # default 60-min window
+    assert clusters_of(rows, tmp_path, cluster_window_min=20) == []
+
+
+def test_stale_cluster_is_not_alerted(tmp_path):
+    fresh = [at(w, 10) for w in ("0xa", "0xb", "0xc")]
+    stale = [at(w, 180) for w in ("0xa", "0xb", "0xc")]                   # same trio, 3 hours ago
+    assert len(clusters_of(fresh, tmp_path)) == 1
+    assert clusters_of(stale, tmp_path) == []
+    assert len(clusters_of([at(w, 40) for w in ("0xa", "0xb", "0xc")], tmp_path)) == 1   # < 45 min
+    assert clusters_of([at(w, 50) for w in ("0xa", "0xb", "0xc")], tmp_path) == []       # > 45 min
+
+
+def test_cluster_reports_price_range(tmp_path):
+    rows = [at("0xa", 10, price=0.58), at("0xb", 8, price=0.60), at("0xc", 5, price=0.62)]
+    (cl,) = clusters_of(rows, tmp_path)
+    assert (round(cl.price_low, 2), round(cl.price_high, 2)) == (0.58, 0.62)
+    msg = format_cluster(cl, {}, T)
+    assert "within 5 min of each other" in msg and "0.58-0.62" in msg
+
+
+def test_large_bet_must_be_recent_and_concentrated(tmp_path):
+    c = cfg(tmp_path)
+    one_hour = [at("0xa", 30 - i * 10, size=8000) for i in range(3)]            # $12k inside 60 min
+    assert len(find_large(build_positions(fills(*one_hour), c, T), c)) == 1
+    spread_out = [at("0xa", 600 - i * 90, size=5000) for i in range(8)]         # $20k over 10 hours
+    assert find_large(build_positions(fills(*spread_out), c, T), c) == []
+    stale = [at("0xa", 300, size=60000)]                                         # $30k, 5 hours ago
+    assert find_large(build_positions(fills(*stale), c, T), c) == []
+
+
+def test_new_top_wallet_with_old_history_causes_no_alerts(tmp_path):
+    c, n = cfg(tmp_path), FakeNotifier()
+    client = FakeClient(traders("0xa"))
+    run_once(c, client, n, now=NOW)
+    client.traders = traders("0xa", "0xb", "0xc", "0xd")                         # leaderboard shuffles
+    now2 = NOW + timedelta(hours=7)                                              # past the refresh time
+    t2 = int(now2.timestamp())
+    for w in ("0xb", "0xc", "0xd"):                                              # their cluster was 5h ago
+        client.rows[w] = [trade_row(w, ts=t2 - 5 * 3600, price=0.5, size=40000)]
+    s = run_once(c, client, n, now=now2)
+    assert s["cluster_alerts"] == 0 and s["large_alerts"] == 0 and len(n.sent) == 1
+
+
+def test_burst_of_alerts_is_bundled_into_one_message(tmp_path):
+    c, n = cfg(tmp_path), FakeNotifier()
+    client = FakeClient(traders("0xa", "0xb", "0xc"))
+    run_once(c, client, n, now=NOW)
+    now2 = NOW + timedelta(minutes=10)
+    t2 = int(now2.timestamp())
+    for w in ("0xa", "0xb", "0xc"):
+        client.rows[w] = [trade_row(w, cond=f"0xgame{g}", title=f"Game {g}", ts=t2 - 120,
+                                    price=0.5, size=2000) for g in range(3)]     # 3 picks x 3 traders
+    s = run_once(c, client, n, now=now2)
+    assert s["cluster_alerts"] == 3 and s["alert_messages"] == 1 and len(n.sent) == 2
+    for g in range(3):
+        assert f"Game {g}" in n.sent[1]
+
+
+def test_pack_messages_never_splits_an_alert():
+    texts = ["a" * 1500, "b" * 1500, "c" * 1500, "d" * 100]
+    groups = pack_messages(texts, limit=3500)
+    assert sorted(i for g in groups for i in g) == [0, 1, 2, 3] and len(groups) == 2
+    assert pack_messages([]) == []
+
+
+def test_second_alert_on_same_pick_is_labelled_update(tmp_path):
+    c, n = cfg(tmp_path), FakeNotifier()
+    client = FakeClient(traders(*WALLETS))
+    run_once(c, client, n, now=NOW)
+    now2 = NOW + timedelta(minutes=10)
+    t2 = int(now2.timestamp())
+    for w in ("0xa", "0xb", "0xc"):
+        client.rows[w] = [trade_row(w, ts=t2 - 300, price=0.5, size=2000)]
+    run_once(c, client, n, now=now2)
+    assert "UPDATE" not in n.sent[-1]
+    now3 = now2 + timedelta(minutes=10)
+    client.rows["0xd"] = [trade_row("0xd", ts=int(now3.timestamp()) - 60, price=0.5, size=2000)]
+    s = run_once(c, client, n, now=now3)
+    assert s["cluster_alerts"] == 1 and "UPDATE: now 4 top traders" in n.sent[-1]
