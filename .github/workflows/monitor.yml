@@ -33,6 +33,8 @@ jobs:
       LEADERBOARD_WINDOW: ${{ vars.LEADERBOARD_WINDOW }}
       WINDOW_HOURS: ${{ vars.WINDOW_HOURS }}
       MIN_WALLETS: ${{ vars.MIN_WALLETS }}
+      CLUSTER_WINDOW_MIN: ${{ vars.CLUSTER_WINDOW_MIN }}
+      MAX_ALERT_AGE_MIN: ${{ vars.MAX_ALERT_AGE_MIN }}
       MIN_WALLET_USD: ${{ vars.MIN_WALLET_USD }}
       CLUSTER_MIN_USD: ${{ vars.CLUSTER_MIN_USD }}
       LARGE_BET_USD: ${{ vars.LARGE_BET_USD }}
